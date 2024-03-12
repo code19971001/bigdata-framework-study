@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+
+<configuration>
+    <!-- 指定NameNode的地址 -->
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://bigdata01:9000</value>
+    </property>
+    <!-- 指定hadoop数据的存储目录 -->
+    <property>
+        <name>hadoop.tmp.dir</name>
+        <value>/opt/software/hadoop-3.3.4/data</value>
+    </property>
+
+    <!-- 配置HDFS网页登录使用的静态用户为code1997 -->
+    <property>
+        <name>hadoop.http.staticuser.user</name>
+        <value>code1997</value>
+    </property>
+
+    <!-- code1997(superUser)允许通过代理访问的主机节点 -->
+    <property>
+        <name>hadoop.proxyuser.code1997.hosts</name>
+        <value>*</value>
+    </property>
+    <!-- 配置该code1997(superUser)允许通过代理用户所属组 -->
+    <property>
+        <name>hadoop.proxyuser.code1997.groups</name>
+        <value>*</value>
+    </property>
+    <!-- 配置该code1997(superUser)允许通过代理的用户-->
+    <property>
+        <name>hadoop.proxyuser.code1997.users</name>
+        <value>*</value>
+    </property>
+</configuration>
