@@ -43,7 +43,7 @@ object InitUtil {
       .bucketBy(5, "orderid")
       .sortBy("orderid")
       .mode(SaveMode.Overwrite)
-      .saveAsTable("sparktuning.course_pay_cluster")
+      .saveAsTable("spark_tuning.course_pay_cluster")
     sparkSession.read.json("/origin_data/apps/spark-tuning/courseshoppingcart.log")
       .write.partitionBy("dt", "dn")
       .bucketBy(5, "orderid")

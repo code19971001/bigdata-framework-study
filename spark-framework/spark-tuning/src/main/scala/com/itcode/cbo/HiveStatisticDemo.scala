@@ -1,4 +1,4 @@
-package cbo
+package com.itcode.cbo
 
 import com.itcode.utils.InitUtil
 import org.apache.spark.SparkConf
