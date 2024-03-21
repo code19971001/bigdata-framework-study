@@ -107,8 +107,7 @@ object InitUtil {
 ```shell
 bin/spark-submit --master yarn --deploy-mode client --driver-memory 2g \
 --num-executors 3 --executor-cores 2 --executor-memory 3g \ 
---class com.itcode.utils.InitUtil \
-/opt/app/spark_tuning/spark-tuning-1.0-SNAPSHOT-jar-with-dependencies.jar
+--class com.itcode.utils.InitUtil /opt/app/spark_tuning/spark-tuning-1.0-SNAPSHOT-jar-with-dependencies.jar
 ```
 注：找不到JDO相关的jar
 ![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1710221785208-9a6a3b87-997a-43dd-b3fe-917060a2bfab.png#averageHue=%23161516&clientId=u62875e1f-9554-4&from=paste&height=302&id=u2158a2ba&originHeight=453&originWidth=2654&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=155103&status=done&style=none&taskId=u98de7505-b0b5-4a7e-a8a1-c6549e94264&title=&width=1769.3333333333333)
@@ -507,45 +506,89 @@ object AutoBroadcastJoinTuning {
 ![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1710255390800-b74f5ed9-f4d3-426d-afe5-05f17e71fda4.png#averageHue=%23f9f9f8&clientId=u62875e1f-9554-4&from=paste&height=311&id=u785ba00e&originHeight=467&originWidth=1881&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=99640&status=done&style=none&taskId=ucd97c301-d429-42bc-9f54-3cfd2684b9c&title=&width=1254)
 使用boardcast join
 ![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1710255341335-3075b11b-99ad-49dc-87eb-134a81ed566d.png#averageHue=%23fafaf9&clientId=u62875e1f-9554-4&from=paste&height=240&id=uf8998de9&originHeight=360&originWidth=1890&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=79369&status=done&style=none&taskId=u246fbd5f-1226-4ca5-b928-566430acd8f&title=&width=1260)
+```scala
+  //TODO SQL Hint方式
+  val sqlStr1: String =
+    """
+      |select /*+  BROADCASTJOIN(sc) */
+      |  sc.courseid,
+      |  csc.courseid
+      |from sale_course sc join course_shopping_cart csc
+      |on sc.courseid=csc.courseid
+    """.stripMargin
+
+  val sqlStr2: String =
+    """
+      |select /*+  BROADCAST(sc) */
+      |  sc.courseid,
+      |  csc.courseid
+      |from sale_course sc join course_shopping_cart csc
+      |on sc.courseid=csc.courseid
+    """.stripMargin
+
+  val sqlStr3: String =
+    """
+      |select /*+  MAPJOIN(sc) */
+      |  sc.courseid,
+      |  csc.courseid
+      |from sale_course sc join course_shopping_cart csc
+      |on sc.courseid=csc.courseid
+    """.stripMargin
+    import org.apache.spark.sql.functions._
+    broadcast(sc)
+      .join(csc, Seq("courseid"))
+      .select("courseid")
+      .explain()
+    while (true) {
+```
 ##### 4.3.2 SMB join
-SMB JOIN 是 sort merge bucket 操作，需要进行分桶，首先会进行排序，然后根据 key值合并，把相同 key 的数据放到同一个 bucket 中（按照 key 进行 hash）。分桶的目的其实就是把大表化成小表。相同 key 的数据都在同一个桶中之后，再进行 join 操作，那么在联合的时候就会大幅度的减小无关项的扫描。
+SMB JOIN 是 sort merge bucket 操作，主要用于两张大表进行join。需要进行分桶，首先会进行排序，然后根据 key值合并，把相同 key 的数据放到同一个 bucket 中（按照 key 进行 hash）。分桶的目的其实就是把大表化成小表。相同 key 的数据都在同一个桶中之后，再进行 join 操作，那么在联合的时候就会大幅度的减小无关项的扫描。
 使用要求：
 
 - 两表进行分桶，桶的个数必须相等。
-- 两边进行join的时候，join列=排序列=分桶列
-```
-def main( args: Array[String] ): Unit = {
+- 两边进行join的时候，join列=排序列=分桶列，分而治之的思想。
+- 如果原表不是分桶表，那么我们可以重建中间表来实现。
+```scala
+object SMBJoinTuning {
 
-  val sparkConf = new SparkConf().setAppName("SMBJoinTuning")
-    .set("spark.sql.shuffle.partitions", "36")
-  val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
-  useSMBJoin(sparkSession)
+  def main(args: Array[String]): Unit = {
+    val sparkConf: SparkConf = new SparkConf().setAppName("SMBJoinTuning")
+      .set("spark.sql.shuffle.partitions", "36")
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+    useSMBJoin(sparkSession)
 
+  }
+
+  def useSMBJoin(sparkSession: SparkSession): Unit = {
+    //查询出三张表 并进行join 插入到最终表中
+    val saleCourse: DataFrame = sparkSession.sql("select *from spark_tuning.sale_course")
+    val coursePay: DataFrame = sparkSession.sql("select * from spark_tuning.course_pay_cluster")
+      .withColumnRenamed("discount", "pay_discount")
+      .withColumnRenamed("createtime", "pay_createtime")
+    val courseShoppingCart: DataFrame = sparkSession.sql("select *from spark_tuning.course_shopping_cart_cluster")
+      .drop("coursename")
+      .withColumnRenamed("discount", "cart_discount")
+      .withColumnRenamed("createtime", "cart_createtime")
+
+    val tmpdata: DataFrame = courseShoppingCart.join(coursePay, Seq("orderid"), "left")
+    val result: DataFrame = broadcast(saleCourse).join(tmpdata, Seq("courseid"), "right")
+    result
+      .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
+        , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
+        "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "spark_tuning.sale_course.dt", "spark_tuning.sale_course.dn")
+      .write
+      .mode(SaveMode.Overwrite)
+      .saveAsTable("spark_tuning.salecourse_detail_2")
+
+  }
 }
-
-def useSMBJoin( sparkSession: SparkSession ) = {
-  //查询出三张表 并进行join 插入到最终表中
-  val saleCourse = sparkSession.sql("select *from sparktuning.sale_course")
-  val coursePay = sparkSession.sql("select * from sparktuning.course_pay_cluster")
-    .withColumnRenamed("discount", "pay_discount")
-    .withColumnRenamed("createtime", "pay_createtime")
-  val courseShoppingCart = sparkSession.sql("select *from sparktuning.course_shopping_cart_cluster")
-    .drop("coursename")
-    .withColumnRenamed("discount", "cart_discount")
-    .withColumnRenamed("createtime", "cart_createtime")
-
-  val tmpdata = courseShoppingCart.join(coursePay, Seq("orderid"), "left")
-  val result = broadcast(saleCourse).join(tmpdata, Seq("courseid"), "right")
-  result
-    .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
-      , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
-      "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "sparktuning.sale_course.dt", "sparktuning.sale_course.dn")
-    .write
-    .mode(SaveMode.Overwrite)
-    .saveAsTable("sparktuning.salecourse_detail_2")
-
-}
 ```
+
+普通大表join：SortMergeJoin，实际花费时间在94s
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1710427821691-11daa5b3-4049-47aa-a107-f88c51bb9b0e.png#averageHue=%23fafafa&clientId=u716e6e99-9aa4-4&from=paste&height=670&id=u82192337&originHeight=1005&originWidth=2149&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=198392&status=done&style=none&taskId=u191f339f-8466-48ae-b3b1-1731a39d03e&title=&width=1432.6666666666667)
+SMB join：实际花费45秒。基本节省了一半的时间
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1710427934889-d110800a-e1a2-48fb-8791-a7311f3a2255.png#averageHue=%23fbfbfb&clientId=u716e6e99-9aa4-4&from=paste&height=470&id=u1b6b4355&originHeight=705&originWidth=2142&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=133326&status=done&style=none&taskId=u04540411-2170-468f-8593-e0cda8a21d8&title=&width=1428)
+实际上当前表只有几个g，因此差别还不是很大。
 ### 5 数据倾斜
 #### 5.1 数据倾斜的现象
 大多数的task的执行速度很快，但是存在几个task任务运行及其缓慢，甚至于慢慢的出现内存溢出的现象。
@@ -554,50 +597,127 @@ def useSMBJoin( sparkSession: SparkSession ) = {
 一般来说发生在shuffle类的算子，比如distinct，groupByKey，ReduceByKey，join等。涉及到数据的重分区，如果其中某一个key数量特别大，就发生了数据倾斜。
 #### 5.2 大key定位
 策略：从所有 key 中，把其中每一个 key 随机取出来一部分，然后进行一个百分比的推算，这是用局部取推算整体，虽然有点不准确，但是在整体概率上来说，我们只需要大概就可以定位那个最多的 key了。
-```
-def main( args: Array[String] ): Unit = {
+```scala
+object SampleKeyDemo {
 
-  val sparkConf = new SparkConf().setAppName("BigJoinDemo")
+  def main(args: Array[String]): Unit = {
+
+    val sparkConf: SparkConf = new SparkConf().setAppName("SampleKeyDemo")
     .set("spark.sql.shuffle.partitions", "36")
     .setMaster("local[*]")
-  val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
 
-  println("=============================================csc courseid sample=============================================")
-  val cscTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession,"sparktuning.course_shopping_cart","courseid")
-  println(cscTopKey.mkString("\n"))
+    println("=============================================csc courseid sample=============================================")
+    val cscTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession, "spark_tuning.course_shopping_cart", "courseid")
+    println(cscTopKey.mkString("\n"))
 
-  println("=============================================sc courseid sample=============================================")
-  val scTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession,"sparktuning.sale_course","courseid")
-  println(scTopKey.mkString("\n"))
+    println("=============================================sc courseid sample=============================================")
+    val scTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession, "spark_tuning.sale_course", "courseid")
+    println(scTopKey.mkString("\n"))
 
-  println("=============================================cp orderid sample=============================================")
-  val cpTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession,"sparktuning.course_pay","orderid")
-  println(cpTopKey.mkString("\n"))
+    println("=============================================cp orderid sample=============================================")
+    val cpTopKey: Array[(Int, Row)] = sampleTopKey(sparkSession, "spark_tuning.course_pay", "orderid")
+    println(cpTopKey.mkString("\n"))
 
-  println("=============================================csc orderid sample=============================================")
-  val cscTopOrderKey: Array[(Int, Row)] = sampleTopKey(sparkSession,"sparktuning.course_shopping_cart","orderid")
-  println(cscTopOrderKey.mkString("\n"))
-}
+    println("=============================================csc orderid sample=============================================")
+    val cscTopOrderKey: Array[(Int, Row)] = sampleTopKey(sparkSession, "spark_tuning.course_shopping_cart", "orderid")
+    println(cscTopOrderKey.mkString("\n"))
+  }
 
 
-def sampleTopKey( sparkSession: SparkSession, tableName: String, keyColumn: String ): Array[(Int, Row)] = {
-  val df: DataFrame = sparkSession.sql("select " + keyColumn + " from " + tableName)
-  val top10Key = df
-    .select(keyColumn).sample(false, 0.1).rdd // 对key不放回采样
+  //对数据的key进行采样
+  def sampleTopKey(sparkSession: SparkSession, tableName: String, keyColumn: String): Array[(Int, Row)] = {
+    val df: DataFrame = sparkSession.sql("select " + keyColumn + " from " + tableName)
+    val top10Key: Array[(Int, Row)] = df
+    .select(keyColumn).sample(withReplacement = false, 0.1).rdd // 对key不放回采样
     .map(k => (k, 1)).reduceByKey(_ + _) // 统计不同key出现的次数
-    .map(k => (k._2, k._1)).sortByKey(false) // 统计的key进行排序
+    .map(k => (k._2, k._1)).sortByKey(ascending = false) // 统计的key进行排序
     .take(10)
-  top10Key
+    top10Key
+  }
 }
 ```
 #### 5.3 倾斜优化
 ##### 5.3.1 单表数据倾斜优化
 为了减少shuffle数据量以及reduce端的压力，Spark sql通常是预聚合+exchange+reduce端聚合，所以执行计划中HashAggregate通常是成对出现的。
-解决方式：两阶段聚合(加盐局部聚合，去盐全局聚合)。
+解决方式：两阶段聚合(加盐局部聚合，去盐全局聚合)。实际上因为spark会自动帮我们进行预聚合，因此实际上基本上用处不大。
+```scala
+object SkewAggregationTuning {
+  def main(args: Array[String]): Unit = {
+
+    val sparkConf: SparkConf = new SparkConf().setAppName("SkewAggregationTuning")
+      .set("spark.sql.shuffle.partitions", "36")
+      .setMaster("local[*]")
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+
+    sparkSession.udf.register("random_prefix", (value: Int, num: Int) => randomPrefixUDF(value, num))
+    sparkSession.udf.register("remove_random_prefix", (value: String) => removeRandomPrefixUDF(value))
+
+
+    val sql1: String =
+      """
+        |select
+        |  courseid,
+        |  sum(course_sell) totalSell
+        |from
+        |  (
+        |    select
+        |      remove_random_prefix(random_courseid) courseid,
+        |      course_sell
+        |    from
+        |      (
+        |        select
+        |          random_courseid,
+        |          sum(sellmoney) course_sell
+        |        from
+        |          (
+        |            select
+        |              random_prefix(courseid, 6) random_courseid,
+        |              sellmoney
+        |            from
+        |              spark_tuning.course_shopping_cart where courseid is not null
+        |          ) t1
+        |        group by random_courseid
+        |      ) t2
+        |  ) t3
+        |group by
+        |  courseid
+        |order by totalSell
+      """.stripMargin
+
+
+    val sql2: String =
+      """
+        |select
+        |  courseid,
+        |  sum(sellmoney) as totalSell
+        |from spark_tuning.course_shopping_cart
+        |where courseid is not null
+        |group by courseid order by totalSell
+      """.stripMargin
+
+    sparkSession.sql(sql1).show(10)
+    sparkSession.sql(sql2).show(10)
+
+    while (true) {}
+  }
+
+
+  def randomPrefixUDF(value: Int, num: Int): String = {
+    new Random().nextInt(num).toString + "_" + value
+  }
+
+  def removeRandomPrefixUDF(value: String): String = {
+    value.toString.split("_")(1)
+  }
+}
+
+```
 ##### 5.3.2 Join优化
 1）广播优化
-适用于小表 join 大表。小表足够小，可被加载进 Driver 并通过 Broadcast 方法广播到各个 Executor 中，可以直接规避掉此shuffle阶段，直接优化掉stage，而且广播join也是SparkSql中最常用的优化方案。
+适用于小表 join 大表。小表足够小，可被收集到Driver 并通过 Broadcast 方法广播到各个 Executor 中，可以直接规避掉此shuffle阶段，直接优化掉stage，广播join也是SparkSql中最常用的优化方案。
 2）拆分大key打散小表
+问题：一个key过分的倾斜，花费时间过长。
 解决逻辑
 
 1. 将存在倾斜的表，根据抽样结果，拆分为倾斜 key（skew 表）和没有倾斜 key（common）的两个数据集。
@@ -608,32 +728,197 @@ def sampleTopKey( sparkSession: SparkSession, tableName: String, keyColumn: Stri
 
 1. 打散大表：实际就是数据一进一出进行处理，对大 key 前拼上随机前缀实现打散。
 2. 扩容小表：实际就是将 DataFrame 中每一条数据，转成一个集合，并往这个集合里循环添加 10 条数据，最后使用 flatmap 压平此集合，达到扩容的效果.
+```scala
+object SkewJoinTuning {
+  def main(args: Array[String]): Unit = {
+    val sparkConf: SparkConf = new SparkConf().setAppName("SkewJoinTuning")
+      .set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      .set("spark.sql.shuffle.partitions", "36")
+      .setMaster("local[*]")
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+
+    scatterBigAndExpansionSmall(sparkSession)
+
+    while (true) {}
+  }
+
+
+  /**
+   * 打散大表  扩容小表 解决数据倾斜
+   *
+   */
+  def scatterBigAndExpansionSmall(sparkSession: SparkSession): Unit = {
+    val saleCourse: DataFrame = sparkSession.sql("select *from spark_tuning.sale_course")
+    val coursePay: DataFrame = sparkSession.sql("select * from spark_tuning.course_pay")
+      .withColumnRenamed("discount", "pay_discount")
+      .withColumnRenamed("createtime", "pay_createtime")
+    val courseShoppingCart: DataFrame = sparkSession.sql("select * from spark_tuning.course_shopping_cart")
+      .withColumnRenamed("discount", "cart_discount")
+      .withColumnRenamed("createtime", "cart_createtime")
+
+    // TODO 1、拆分 倾斜的key
+    val commonCourseShoppingCart: Dataset[Row] = courseShoppingCart.filter(item => item.getAs[Long]("courseid") != 101 && item.getAs[Long]("courseid") != 103)
+    val skewCourseShoppingCart: Dataset[Row] = courseShoppingCart.filter(item => item.getAs[Long]("courseid") == 101 || item.getAs[Long]("courseid") == 103)
+
+    //TODO 2、将倾斜的key打散  打散36份
+    import sparkSession.implicits._
+    val newCourseShoppingCart: Dataset[CourseShoppingCart] = skewCourseShoppingCart.mapPartitions((partitions: Iterator[Row]) => {
+      partitions.map(item => {
+        val courseid: Long = item.getAs[Long]("courseid")
+        val randInt: Int = Random.nextInt(36)
+        CourseShoppingCart(courseid, item.getAs[String]("orderid"),
+          item.getAs[String]("coursename"), item.getAs[String]("cart_discount"),
+          item.getAs[String]("sellmoney"), item.getAs[String]("cart_createtime"),
+          item.getAs[String]("dt"), item.getAs[String]("dn"), randInt + "_" + courseid)
+      })
+    })
+    //TODO 3、小表进行扩容 扩大36倍
+    import sparkSession.implicits._
+    val newSaleCourse: Dataset[SaleCourse] = saleCourse.flatMap(item => {
+      val list = new ArrayBuffer[SaleCourse]()
+      val courseid: Long = item.getAs[Long]("courseid")
+      val coursename: String = item.getAs[String]("coursename")
+      val status: String = item.getAs[String]("status")
+      val pointlistid: Long = item.getAs[Long]("pointlistid")
+      val majorid: Long = item.getAs[Long]("majorid")
+      val chapterid: Long = item.getAs[Long]("chapterid")
+      val chaptername: String = item.getAs[String]("chaptername")
+      val edusubjectid: Long = item.getAs[Long]("edusubjectid")
+      val edusubjectname: String = item.getAs[String]("edusubjectname")
+      val teacherid: Long = item.getAs[Long]("teacherid")
+      val teachername: String = item.getAs[String]("teachername")
+      val coursemanager: String = item.getAs[String]("coursemanager")
+      val money: String = item.getAs[String]("money")
+      val dt: String = item.getAs[String]("dt")
+      val dn: String = item.getAs[String]("dn")
+      for (i <- 0 until 36) {
+        list.append(SaleCourse(courseid, coursename, status, pointlistid, majorid, chapterid, chaptername, edusubjectid,
+          edusubjectname, teacherid, teachername, coursemanager, money, dt, dn, i + "_" + courseid))
+      }
+      list
+    })
+
+    // TODO 4、倾斜的大key 与  扩容后的表 进行join
+    val df1: DataFrame = newSaleCourse
+      .join(newCourseShoppingCart.drop("courseid").drop("coursename"), Seq("rand_courseid", "dt", "dn"), "right")
+      .join(coursePay, Seq("orderid", "dt", "dn"), "left")
+      .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
+        , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
+        "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "dt", "dn")
+
+
+    // TODO 5、没有倾斜大key的部分 与 原来的表 进行join
+    val df2: DataFrame = saleCourse
+      .join(commonCourseShoppingCart.drop("coursename"), Seq("courseid", "dt", "dn"), "right")
+      .join(coursePay, Seq("orderid", "dt", "dn"), "left")
+      .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
+        , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
+        "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "dt", "dn")
+
+    // TODO 6、将 倾斜key join后的结果 与 普通key join后的结果，uinon起来
+    df1
+      .union(df2)
+      .write.mode(SaveMode.Overwrite).insertInto("spark_tuning.salecourse_detail")
+  }
+
+}
+```
 ### 6 Job优化
 ![](https://cdn.nlark.com/yuque/0/2024/png/29530415/1709173024440-17736800-acd2-442f-a65c-d08c23caf4c5.png#averageHue=%23d8e8b7&clientId=u8bea0fba-815c-4&from=paste&id=u41bf3b7b&originHeight=409&originWidth=713&originalType=url&ratio=1.5&rotation=0&showTitle=false&status=done&style=none&taskId=uf44a1aa2-068d-4e61-af4a-d4ad6e4bad8&title=)
 #### 6.1 Map端优化
 ##### 6.1.1 Map 端聚合
+Map-side预聚合，就是在每个节点本地对相同的key进行一次聚合操作，类似与MapReduce的本地combiner。map-side预聚合之后，每个节点本地就只会有一条相同的key，因为多条相同的key都被聚合起来了，其他节点在拉去所有节点上的相同key的时候，就会大大减少需要拉取的数据量，从而减少磁盘IO和网络传输的开销。RDD操作建议使用reduceByKey或者aggregrateByKey（存在预聚合操作）算子来替代groupByKey算子。
 SparkSQL 本身的 HashAggregte 就会实现本地预聚合+全局聚合。
 ##### 6.1.2 读取小文件优化
 读取的数据源有很多小文件，会造成查询性能的损耗，大量的数据分片信息以及对应产生的 Task 元信息也会给 Spark Driver 的内存造成压力，带来单点问题。
 参数：
 
-- spark.sql.files.maxPartitionBytes=128MB 默认 128m：文件最大分区字节数。
-- spark.files.openCostInBytes=4194304 默认 4m：打开一个文件的开销。
+- spark.sql.files.maxPartitionBytes=128MB 默认 128m：分区最大字节数。
+- spark.files.openCostInBytes=4194304 默认 4m：打开一个文件的额外开销。
 
 ![](https://cdn.nlark.com/yuque/0/2024/png/29530415/1709173024559-dbac55ca-6f2d-4071-afff-3ed84a06b075.png#averageHue=%23fcf9f8&clientId=u8bea0fba-815c-4&from=paste&id=u2ca05448&originHeight=746&originWidth=777&originalType=url&ratio=1.5&rotation=0&showTitle=false&status=done&style=none&taskId=u1ae0c5dc-c0d7-4b3d-bf85-cf9901cc240&title=)
 解析：
 
-1. 切片大小= Math.min(defaultMaxSplitBytes, Math.max(openCostInBytes, bytesPerCore))，计算 totalBytes 的时候，每个文件都要加上一个 open 开销defaultParallelism 就是 RDD 的并行度。
-2. 当（文件 1 大小+ openCostInBytes）+（文件 2 大小+ openCostInBytes）+…+（文件n-1 大小+ openCostInBytes）+ 文件 n <= maxPartitionBytes 时，n 个文件可以读入同一个分区，即满足： N 个小文件总大小 + （N-1）*openCostInBytes <= maxPartitionBytes 的话。6.2.
+1. 切片大小= Math.min(defaultMaxSplitBytes, Math.max(openCostInBytes, bytesPerCore))，计算 totalBytes 的时候，每个文件都要加上一个 open 开销。defaultParallelism 就是 RDD 的并行度。
+2. 当（文件 1 大小+ openCostInBytes）+（文件 2 大小+ openCostInBytes）+…+（文件n-1 大小+ openCostInBytes）+ 文件 n <= maxPartitionBytes 时，n 个文件可以读入同一个分区，即满足： N 个小文件总大小 + N*openCostInBytes <= maxPartitionBytes 的话，可以将这些文件读取到一个数据分区中。因为存在文件开销，因此最终每个分区的文件大小不会超过我们预设的值。
+
+经验：
+
+1. 如果小文件过多，我们可以将开启文件开销的设置的和小文件大小一致。
+```scala
+object MapSmallFileTuning {
+
+
+  def main(args: Array[String]): Unit = {
+    val sparkConf: SparkConf = new SparkConf().setAppName("MapSmallFileTuning")
+      .set("spark.files.openCostInBytes", "7194304") //默认4m
+      .set("spark.sql.files.maxPartitionBytes", "128MB") //默认128M
+      .setMaster("local[1]") //TODO 要打包提交集群执行，注释掉
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+
+
+    sparkSession.sql("select * from spark_tuning.course_shopping_cart")
+      .write
+      .mode(SaveMode.Overwrite)
+      .saveAsTable("spark_tuning.course_shopping_cart_merge")
+
+
+    while (true) {}
+  }
+}
+```
 ##### 6.1.3 增大map 溢写 时流 输出流 buffer
-1）map 端 Shuffle Write 有一个缓冲区，初始阈值 5m，超过会尝试增加到 2*当前使用内存。如果申请不到内存，则进行溢写。是 这个参数是 internal ，指定） 无效（见下方源码）。也就是说资源足够会自动扩容，所以不需要我们去设置。
-2）溢写时使用输出流缓冲区默认 32k，这些缓冲区减少了磁盘搜索和系统调用次数，适当提高可以提升溢写效率。
-3）shuffle 文件涉及到序列化，是采取批的方式读写，默认按照每批次 1 万条去读写。设置得太低会导致在序列化时过度复制，因为一些序列化器通过增长和复制的方式来翻倍内部数据结构。这个参数是 internal，指定无效。
+1）map 端 Shuffle Write 有一个缓冲区，初始阈值 5m，可以自动扩容，超过会尝试增加到 2*当前使用内存。如果申请不到内存，则进行溢写。是 这个参数是 **internal** 的，指定无效（见下方源码）。也就是说资源足够会自动扩容，所以不需要我们去设置。假设，我们当前使用内存为6m，那么会尝试申请7m(6*2-5)的内存。
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1711001301417-6aee1495-c8fb-4b2e-be6d-56cad52f6cd2.png#averageHue=%23fbfafa&clientId=uec3be2bf-1d64-4&from=paste&height=723&id=TDEOe&originHeight=1085&originWidth=2310&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=221336&status=done&style=none&taskId=uc465e9a4-0c68-42c5-b5ee-9a0389ad63b&title=&width=1540)
+2）溢写时使用输出流缓冲区来实现的。默认32k，这些缓冲区减少了磁盘搜索和系统调用次数，适当提高可以提升溢写效率。
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1711001422635-a4c54a48-0337-42de-9551-25036461e37b.png#averageHue=%23fbfaf9&clientId=uec3be2bf-1d64-4&from=paste&height=249&id=sMvsI&originHeight=374&originWidth=1262&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=61313&status=done&style=none&taskId=u52b615f7-5dae-4d63-b4ca-29cbb7d97b9&title=&width=841.3333333333334)
+3）shuffle 文件涉及到序列化，是采取批的方式读写，默认按照每批次 1 万条去读写。设置得太低会导致在序列化时过度复制，因为一些序列化器通过增长和复制的方式来翻倍内部数据结构。这个参数是 **internal**，指定无效。
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1711001530494-fa6af2da-036b-484d-854c-3113e1772317.png#averageHue=%237abcc7&clientId=uec3be2bf-1d64-4&from=paste&height=312&id=rKuZo&originHeight=468&originWidth=1433&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=79876&status=done&style=none&taskId=u490937c5-3d57-43c4-837c-d5625f88a65&title=&width=955.3333333333334)
+```scala
+object MapFileBufferTuning {
+
+
+  def main(args: Array[String]): Unit = {
+    val sparkConf: SparkConf = new SparkConf().setAppName("MapFileBufferTuning")
+      .set("spark.sql.shuffle.partitions", "36")
+      .set("spark.shuffle.file.buffer", "64") //对比 shuffle write 的stage 耗时
+    //      .set("spark.shuffle.spill.batchSize", "20000")// 不可修改
+    //      .set("spark.shuffle.spill.initialMemoryThreshold", "104857600")//不可修改
+    //      .setMaster("local[1]") //TODO 要打包提交集群执行，注释掉
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+
+    //查询出三张表 并进行join 插入到最终表中
+    val saleCourse: DataFrame = sparkSession.sql("select * from spark_tuning.sale_course")
+    val coursePay: DataFrame = sparkSession.sql("select * from spark_tuning.course_pay")
+      .withColumnRenamed("discount", "pay_discount")
+      .withColumnRenamed("createtime", "pay_createtime")
+    val courseShoppingCart: DataFrame = sparkSession.sql("select * from spark_tuning.course_shopping_cart")
+      .drop("coursename")
+      .withColumnRenamed("discount", "cart_discount")
+      .withColumnRenamed("createtime", "cart_createtime")
+
+    saleCourse
+      .join(courseShoppingCart, Seq("courseid", "dt", "dn"), "right")
+      .join(coursePay, Seq("orderid", "dt", "dn"), "left")
+      .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
+        , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
+        "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "dt", "dn")
+      .write.mode(SaveMode.Overwrite).saveAsTable("spark_tuning.salecourse_detail")
+
+    //    while (true) {}
+  }
+}
+
+```
+默认情况下缓冲区大小为32k和128k的shuffle write对比：数据量比较小，效果不是很明显。
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1711002284462-139112b0-d976-4b4a-afee-f99893613661.png#averageHue=%23faf9f9&clientId=uec3be2bf-1d64-4&from=paste&height=231&id=u5103d31d&originHeight=347&originWidth=2209&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=66003&status=done&style=none&taskId=u2a93c3f5-6d90-49b6-a174-7780f3f7e1e&title=&width=1472.6666666666667)
+![image.png](https://cdn.nlark.com/yuque/0/2024/png/29530415/1711002691342-f58c1eee-6244-4cbc-82a9-082fc645bae2.png#averageHue=%23faf9f9&clientId=uec3be2bf-1d64-4&from=paste&height=232&id=u5d71251b&originHeight=348&originWidth=2201&originalType=binary&ratio=1.5&rotation=0&showTitle=false&size=67282&status=done&style=none&taskId=uc1da2e75-d40d-48eb-a153-91dc2c5fb66&title=&width=1467.3333333333333)
 #### 6.2 reduce端优化
 ##### 6.2.1 合理设置reduce数
 过多的 cpu 资源出现空转浪费，过少影响任务性能。关于并行度、并发度的相关参数介绍，参照之前的介绍。
 ##### 6.2.2 输出产生小文件优化
-1）join 结果插入新表
+join 结果插入新表
+1）没有分区的情况下
 生成的文件数等于 shuffle 并行度，默认就是 200 份文件插入到hdfs 上(无分区)。
 解决方式：
 
@@ -643,28 +928,31 @@ SparkSQL 本身的 HashAggregte 就会实现本地预聚合+全局聚合。
 2）有动态分区插入数据
 
 1. 没有shuffle的情况下，最差的情况下，每个task中都有表各个分区的记录，那么最终文件数将达到task数*表分区数，这种情况下极容易产生小文件。
-```
+```sql
 INSERT overwrite table A partition ( aa )
 SELECT * FROM B;
 ```
 
-2. 有 Shuffle 的情况下，上面的 Task 数量 就变成了 spark.sql.shuffle.partitions（默认值200）。那么最差情况就会有 spark.sql.shuffle.partitions * 表分区数。当 spark.sql.shuffle.partitions 设 置 过 大 时 ， 小 文 件 问 题 就 产 生 了 ； 当spark.sql.shuffle.partitions 设置过小时，任务的并行度就下降了，性能随之受到影响。
+2. 有 Shuffle 的情况下，上面的 Task 数量 就变成了 spark.sql.shuffle.partitions（默认值200）。那么最差情况就会有 spark.sql.shuffle.partitions * 表分区数。
+   1. 当 spark.sql.shuffle.partitions 设 置 过 大 时 ， 小 文 件 问 题 就 产 生 了 ；
+   2.  当spark.sql.shuffle.partitions 设置过小时，任务的并行度就下降了，性能随之受到影响。
 3. 最理想的情况是根据分区字段进行 shuffle，在上面的 sql 中加上 distribute by aa。把同一分区的记录都哈希到同一个分区中去，由一个 Spark 的 Task 进行写入，这样的话只会产生 N 个文件, 但是这种情况下也容易出现数据倾斜的问题。
 
-解决思路：
+**解决思路：**
 结合解决倾斜的思路，在确定哪个分区键倾斜的情况下，将倾斜的分区键单独拎出来：将入库的 SQL 拆成（where 分区 != 倾斜分区键 ）和 （where 分区 = 倾斜分区键） 几个部分，非倾斜分区键的部分正常 distribute by 分区字段，倾斜分区键的部分 distribute by随机数，sql 如下：
-```
-//1.非倾斜键部分
+```sql
+-- 1.非倾斜键部分
 INSERT overwrite table A partition ( aa )
 SELECT *
 FROM B where aa != 大 key
 distribute by aa;
-//2.倾斜键部分
+-- 2.倾斜键部分
 INSERT overwrite table A partition ( aa )
 SELECT *
 FROM B where aa = 大 key
 distribute by cast(rand() * 5 as int);
 ```
+
 ##### 6.2.3 增大reduce缓冲区
 Spark Shuffle 过程中，shuffle reduce task 的 buffer 缓冲区大小决定了 reduce task 每次能够缓冲的数据量，也就是每次能够拉取的数据量，如果内存资源较为充足，适当增加拉取数据缓冲区的大小，可以减少拉取数据的次数，也就可以减少网络传输的次数，进而提升性能。reduce 端数据拉取缓冲区的大小可以通过spark.reducer.maxSizeInFlight 参数进行设置，默认为 48MB，一般是够用的，但是不能设置太大，因为。
 我们可以通过shuffle read的读取时间来观测缓冲区大小对shuffle read的影响(橙色部分，上面为1m，下面为96m)，但是如果数据量不是很大，整体的收益是不大的。
@@ -679,13 +967,47 @@ Spark Shuffle 过程中，reduce task 拉取属于自己的数据时，如果因
 ##### 6.2.6 合理使用bypass
 当ShuffleManager为SortShuffleManager的时候，如果满足以下的条件，可以使用bypass
 
-- shuffle read task 的数量小于这个阈值（默认是 200）
+- shuffle read task 的数量小于阈值（默认是 200）
 - 不需要 map 端进行合并操作
 - shuffle write 过程中不会进行排序操作
 
 使用 BypassMergeSortShuffleWriter 去写数据，但是最后会将每个 task 产生的所有临时磁盘文件都合并成一个文件，并会创建单独的索引文件。
 源码：SortShuffleManager.registerShuffle()
 ![](https://cdn.nlark.com/yuque/0/2024/png/29530415/1709173025264-96b9c57a-f7cd-48ff-96e5-a624b3f95c29.png#averageHue=%23fbf9f7&clientId=u8bea0fba-815c-4&from=paste&id=ue4c2aec0&originHeight=933&originWidth=729&originalType=url&ratio=1.5&rotation=0&showTitle=false&status=done&style=none&taskId=u307451f8-6494-4635-9b1b-89d284dad38&title=)
+```scala
+object BypassTuning {
+
+
+  def main(args: Array[String]): Unit = {
+    val sparkConf: SparkConf = new SparkConf().setAppName("BypassTuning")
+      .set("spark.sql.shuffle.partitions", "36")
+      .set("spark.shuffle.sort.bypassMergeThreshold", "30") //bypass阈值，默认200,改成30对比效果
+      .setMaster("local[*]") //TODO 要打包提交集群执行，注释掉
+    val sparkSession: SparkSession = InitUtil.initSparkSession(sparkConf)
+
+
+    //查询出三张表 并进行join 插入到最终表中
+    val saleCourse: DataFrame = sparkSession.sql("select * from spark_tuning.sale_course")
+    val coursePay: DataFrame = sparkSession.sql("select * from spark_tuning.course_pay")
+      .withColumnRenamed("discount", "pay_discount")
+      .withColumnRenamed("createtime", "pay_createtime")
+    val courseShoppingCart: DataFrame = sparkSession.sql("select * from spark_tuning.course_shopping_cart")
+      .drop("coursename")
+      .withColumnRenamed("discount", "cart_discount")
+      .withColumnRenamed("createtime", "cart_createtime")
+
+    saleCourse
+      .join(courseShoppingCart, Seq("courseid", "dt", "dn"), "right")
+      .join(coursePay, Seq("orderid", "dt", "dn"), "left")
+      .select("courseid", "coursename", "status", "pointlistid", "majorid", "chapterid", "chaptername", "edusubjectid"
+        , "edusubjectname", "teacherid", "teachername", "coursemanager", "money", "orderid", "cart_discount", "sellmoney",
+        "cart_createtime", "pay_discount", "paymoney", "pay_createtime", "dt", "dn")
+      .write.mode(SaveMode.Overwrite).saveAsTable("spark_tuning.salecourse_detail")
+
+    while (true) {}
+  }
+}
+```
 #### 6.3 整体优化
 ##### 6.3.1 数据本地化等待时长
 在 Spark 项目开发阶段，可以使用 client 模式对程序进行测试，此时，可以在本地看到比较全的日志信息，日志信息中有明确的 Task 数据本地化的级别，如果大部分都是ROCESS_LOCAL(计算逻辑和数据在同一个jvm中)、NODE_LOCAL(数据和计算在同一个服务器上)，那么就无需进行调节，但是如果发现很多的级别都是RACK_LOCAL(数据和计算在相同的机架上)、ANY(数据和计算在不同的机架上)，那么需要对本地化的等待时长进行调节，应该是反复调节，每次调节完以后，再来运行观察日志，看看大部分的 task 的本地化级别有没有提升；看看，整个spark 作业的运行时间有没有缩短。
@@ -699,7 +1021,7 @@ spark.locality.wait.rack //建议 20s
 ```
 ##### 6.3.2 使用堆外内存
 1）堆外内存参数
-讲到堆外内存，就必须去提一个东西，那就是去 yarn 申请资源的单位，容器。Spark on yarn 模式，一个容器到底申请多少内存资源。一个容器最多可以申请多大资源，是由 yarn 参数 yarn.scheduler.maximum-allocation-mb 决定， 需要满足：spark.executor.memoryOverhead + spark.executor.memory + spark.memory.offHeap.size≤ yarn.scheduler.maximum-allocation-mb
+讲到堆外内存，就必须去提一个东西，那就是去 yarn 申请资源的单位是容器。Spark on yarn 模式，一个容器到底申请多少内存资源。一个容器最多可以申请多大资源，是由 yarn 参数 yarn.scheduler.maximum-allocation-mb 决定， 需要满足：spark.executor.memoryOverhead + spark.executor.memory + spark.memory.offHeap.size≤ yarn.scheduler.maximum-allocation-mb
 参数：
 
 - spark.executor.memory：提交任务时指定的堆内内存。
@@ -712,13 +1034,14 @@ spark.locality.wait.rack //建议 20s
 - 3.0以后：去申请yarn的内存资源为3个参数相加。
 
 2）使用堆外缓存
-使用堆外内存可以减轻垃圾回收的工作，也加快了复制的速度。当需要缓存非常大的数据量时，虚拟机将承受非常大的 GC 压力，因为虚拟机必须检查每个对象是否可以收集并必须访问所有内存页。本地缓存是最快的，但会给虚拟机带来GC 压力，所以，当你需要处理非常多 GB 的数据量时可以考虑使用堆外内存来进行优化，因为这不会给 Java 垃圾收集器带来任何压力。让 JAVA GC 为应用程序完成工作，缓存操作交给堆外。
+使用堆外内存可以减轻垃圾回收的工作，也加快了复制的速度。
+当需要缓存非常大的数据量时，虚拟机将承受非常大的 GC 压力，因为虚拟机必须检查每个对象是否可以收集并必须访问所有内存页。堆内缓存是最快的，但会给虚拟机带来GC 压力，所以，当需要处理非常多 GB 的数据量时可以考虑使用堆外内存来进行优化，因为这不会给 Java 垃圾收集器带来任何压力。让 JAVA GC 为应用程序完成工作，缓存操作交给堆外。
 web ui上的Storage Memory指的是堆内的存储加执行+堆外的存储(堆外内存分为执行和存储，各占一半)。
 ##### 6.3.3 调节连接等待时长
 在 Spark 作业运行过程中，Executor 优先从自己本地关联的 BlockManager(管理数据的) 中获取某份数据，如果本地 BlockManager 没有的话，会通过TransferService 远程连接其他节点上Executor 的 BlockManager 来获取数据。
 如果 task 在运行过程中创建大量对象或者创建的对象较大，会占用大量的内存，这回导致频繁的垃圾回收，但是垃圾回收会导致工作现场全部停止，也就是说，垃圾回收一旦执行，Spark 的 Executor 进程就会停止工作，无法提供相应，此时，由于没有响应，无法建立网络连接，会导致网络连接超时。
 在生产环境下，有时会遇到 file not found、file lost 这类错误，在这种情况下，很有可能是 Executor 的 BlockManager 在拉取数据的时候，无法建立连接，然后超过默认的连接等待时长 120s 后，宣告数据拉取失败，如果反复尝试都拉取不到数据，可能会导致 Spark 作业的崩溃。这种情况也可能会导致 DAGScheduler 反复提交几次 stage，TaskScheduler 反复提交几次 task，大大延长了我们的 Spark 作业的运行时间。
-为了避免长时间暂停(如 GC)导致的超时，可以考虑调节连接的超时时长，连接等待时长需要在 spark-submit 脚本中进行设置，设置方式可以在提交时指定：--conf spark.core.connection.ack.wait.timeout=300s
+spark.core.connection.ack.wait.timeout/spark.network.timeout：为了避免长时间暂停(如 GC)导致的超时，可以考虑调节连接的超时时长，连接等待时长需要在 spark-submit 脚本中进行设置，设置方式可以在提交时指定
 ### 7 spark3.0 AQE
 Spark 在 3.0 版本推出了 AQE（Adaptive Query Execution），即自适应查询执行。AQE 是Spark SQL 的一种动态优化机制，在运行时，每当 Shuffle Map 阶段执行完毕，AQE 都会结合这个阶段的统计信息，基于既定的规则动态地调整、修正尚未执行的逻辑计划和物理计划，来完成对原始查询语句的运行时优化。
 #### 7.1 动态合并分区
@@ -741,15 +1064,15 @@ Spark 支持多种 join 策略，其中如果 join 的一张表可以很好的�
 #### 7.3 动态优化Join倾斜
 当数据在群集中的分区之间分布不均匀时，就会发生数据倾斜。严重的倾斜会大大降低查询性能，尤其对于 join。AQE skew join 优化会从随机 shuffle 文件统计信息自动检测到这种倾斜。然后它将倾斜分区拆分成较小的子分区。
 ![](https://cdn.nlark.com/yuque/0/2024/png/29530415/1709173026349-601de37b-c9c4-46ef-82c1-5d69772e4eaa.png#averageHue=%23faf5ef&clientId=u8bea0fba-815c-4&from=paste&id=ue36ea8dc&originHeight=777&originWidth=1044&originalType=url&ratio=1.5&rotation=0&showTitle=false&status=done&style=none&taskId=u9ff4cf96-458a-4a60-bf23-dfcf68ede4a&title=)
-没有这种优化，会导致其中一个分区特别耗时拖慢整个 stage,有了这个优化之后每个task 耗时都会大致相同，从而总体上获得更好的性能。
+如果没有这种优化，会导致其中一个分区特别耗时拖慢整个 stage,有了这个优化之后每个task 耗时都会大致相同，从而总体上获得更好的性能。
 3.0有了AQE机制，就可以交给Spark自行解决，Spark3.0增加了以下参数：
 
-- spark.sql.adaptive.skewJoin.enabled：是否开启倾斜 join 检测，如果开启了，那么会将倾斜的分区数据拆成多个分区,默认是开启的，但是得打开 aqe。
+- spark.sql.adaptive.skewJoin.enabled：是否开启倾斜 join 检测，如果开启了，那么会将倾斜的分区数据拆成多个分区，默认是开启的，但是需要先开启AQE。
 - spark.sql.adaptive.skewJoin.skewedPartitionFactor：默认值 5，此参数用来判断分区数据量是否数据倾斜，当任务中最大数据量分区对应的数据量大于的分区中位数乘以此参数，并且也大于 spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes 参数，那么此任务是数据倾斜。
 - spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes :默认值 256mb，用于判断是否数据倾斜。
 - spark.sql.adaptive.advisoryPartitionSizeInBytes :此参数用来告诉 spark 进行拆分后推荐分区大小是多少。
+> 如果同时开启了 spark.sql.adaptive.coalescePartitions.enabled 动态合并分区功能，那么会先合并分区，再去判断倾斜，因此两者是互相干扰的。
 
-如果同时开启了 spark.sql.adaptive.coalescePartitions.enabled 动态合并分区功能，那么会先合并分区，再去判断倾斜。
 ### 8 Spark3.0 DPP
 Spark3.0 支持动态分区裁剪 Dynamic Partition Pruning，简称 DPP，核心思路就是先将join 一侧作为子查询计算出来，再将其所有分区用到 join 另一侧作为表过滤条件，从而实现对分区的动态修剪。如下图所示：
 ![](https://cdn.nlark.com/yuque/0/2024/png/29530415/1709173026435-f8cb5041-44eb-4b66-8df2-fa5448f80b0f.png#averageHue=%23fbfbfb&clientId=u8bea0fba-815c-4&from=paste&id=u63a53f36&originHeight=282&originWidth=1003&originalType=url&ratio=1.5&rotation=0&showTitle=false&status=done&style=none&taskId=u338d53ec-78b2-47b5-84d1-d750d739dde&title=)
@@ -762,13 +1085,30 @@ select t1.id,t2.pkey from t1 join t2 on t1.pkey=t2.pkey and t1.pkey in(select t2
 触发条件：
 
 1. 待裁剪的表 join 的时候，join 条件里必须有分区字段
-2. 如果是需要修剪左表，那么 join 必须是 inner join ,left semi join 或 right join,反之亦然。但如果是 left out join,无论右边有没有这个分区，左边的值都存在，就不需要被裁剪。
+2. 如果是需要修剪左表，那么 join 必须是 inner join ,left semi join 或 right join,反之亦然。但如果是 left out join，无论右边有没有这个分区，左边的值都存在，就不需要被裁剪。
 3. 另一张表需要存在至少一个过滤条件，比如 a join b on a.key=b.key and a.id<2
+```latex
+== Physical Plan ==
+AdaptiveSparkPlan isFinalPlan=false
++- Project [id#0L, name#1, age#2, name#5]
+   +- BroadcastHashJoin [partition#3], [partition#6], Inner, BuildRight, false
+      :- FileScan parquet spark_tuning.test_student[id#0L,name#1,age#2,partition#3] Batched: true, DataFilters: [], Format: Parquet, Location: InMemoryFileIndex(100 paths)[hdfs://bigdata01:9000/user/hive/warehouse/spark_tuning.db/test_stude..., PartitionFilters: [isnotnull(partition#3), dynamicpruningexpression(partition#3 IN dynamicpruning#13)], PushedFilters: [], ReadSchema: struct<id:bigint,name:string,age:int>
+      :     +- SubqueryAdaptiveBroadcast dynamicpruning#13, 0, true, Project [name#5, partition#6], [partition#6]
+      :        +- AdaptiveSparkPlan isFinalPlan=false
+      :           +- Project [name#5, partition#6]
+      :              +- Filter (isnotnull(id#4L) AND (id#4L < 1000))
+      :                 +- FileScan parquet spark_tuning.test_school[id#4L,name#5,partition#6] Batched: true, DataFilters: [isnotnull(id#4L), (id#4L < 1000)], Format: Parquet, Location: InMemoryFileIndex(100 paths)[hdfs://bigdata01:9000/user/hive/warehouse/spark_tuning.db/test_schoo..., PartitionFilters: [isnotnull(partition#6)], PushedFilters: [IsNotNull(id), LessThan(id,1000)], ReadSchema: struct<id:bigint,name:string>
+      +- BroadcastExchange HashedRelationBroadcastMode(List(cast(input[1, int, true] as bigint)),false), [plan_id=29]
+         +- Project [name#5, partition#6]
+            +- Filter (isnotnull(id#4L) AND (id#4L < 1000))
+               +- FileScan parquet spark_tuning.test_school[id#4L,name#5,partition#6] Batched: true, DataFilters: [isnotnull(id#4L), (id#4L < 1000)], Format: Parquet, Location: InMemoryFileIndex(100 paths)[hdfs://bigdata01:9000/user/hive/warehouse/spark_tuning.db/test_schoo..., PartitionFilters: [isnotnull(partition#6)], PushedFilters: [IsNotNull(id), LessThan(id,1000)], ReadSchema: struct<id:bigint,name:string>
+
+```
 ### 9 Spark3.0 Hint增强
 在 spark2.4 的时候就有了 hint 功能，不过只有 broadcasthash join 的 hint,这次 3.0 又增加了 sort merge join,shuffle_hash join,shuffle_replicate nested loop join。
 Spark 的 5 种 Join 策略：[https://www.cnblogs.com/jmx-bigdata/p/14021183.html](https://www.cnblogs.com/jmx-bigdata/p/14021183.html)
 1）broadcasthast join
-```
+```scala
 sparkSession.sql("select /*+ BROADCAST(school) */ * from test_student
 student left join test_school school on student.id=school.id").show()
 sparkSession.sql("select /*+ BROADCASTJOIN(school) */ * from
@@ -778,7 +1118,7 @@ sparkSession.sql("select /*+ MAPJOIN(school) */ * from test_student
 student left join test_school school on student.id=school.id").show()
 ```
 2）sort merge join
-```
+```scala
 sparkSession.sql("select /*+ SHUFFLE_MERGE(school) */ * from
 test_student student left join test_school school on
 student.id=school.id").show()
@@ -788,24 +1128,26 @@ sparkSession.sql("select /*+ MERGE(school) */ * from test_student
 student left join test_school school on student.id=school.id").show()
 ```
 3）shuffle_hash join
-```
+```scala
 sparkSession.sql("select /*+ SHUFFLE_HASH(school) */ * from test_student
 student left join test_school school on student.id=school.id").show()
 ```
 4）shuffle_replicate_nl join
 使用条件非常苛刻，驱动表（school 表）必须小,且很容易被 spark 执行成 sort merge join。
-```
+```scala
 sparkSession.sql("select /*+ SHUFFLE_REPLICATE_NL(school) */ * from
 test_student student inner join test_school school on
 student.id=school.id").show()
 ```
 ### 10 故障排除
 #### 10.1 控制 reduce 端缓冲大小以避免 OOM
-		在 Shuffle 过程，reduce 端 task 并不是等到 map 端 task 将其数据全部写入磁盘后再去拉取，而是 map 端写一点数据，reduce 端 task 就会拉取一小部分数据，然后立即进行后面的聚合、算子函数的使用等操作。		reduce 端 task 能够拉取多少数据，由 reduce 拉取数据的缓冲区 buffer 来决定，因为拉取过来的数据都是先放在 buffer 中，然后再进行后续的处理，buffer 的默认大小为 48MB。
-		reduce 端 task 会一边拉取一边计算，不一定每次都会拉满 48MB 的数据，可能大多数时候拉取一部分数据就处理掉了。		虽然说增大 reduce 端缓冲区大小可以减少拉取次数，提升 Shuffle 性能，但是有时map 端的数据量非常大，写出的速度非常快，此时 reduce 端的所有 task 在拉取的时候，有可能全部达到自己缓冲的最大极限值，即 48MB，此时，再加上 reduce 端执行的聚合函数的代码，可能会创建大量的对象，这可难会导致内存溢出，即 OOM。		如果一旦出现 reduce 端内存溢出的问题，我们可以考虑减小 reduce 端拉取数据缓冲区的大小，例如减少为 12MB。		在实际生产环境中是出现过这种问题的，这是典型的以性能换执行的原理。reduce 端拉取数据的缓冲区减小，不容易导致 OOM，但是相应的，reudce 端的拉取次数增加，造成更多的网络传输开销，造成性能的下降。注意，要保证任务能够运行，再考虑性能的优化。
+在 Shuffle 过程，reduce 端 task 并不是等到 map 端 task 将其数据全部写入磁盘后再去拉取，而是 map 端写一点数据，reduce 端 task 就会拉取一小部分数据，然后立即进行后面的聚合、算子函数的使用等操作。reduce 端 task 能够拉取多少数据，由 reduce 拉取数据的缓冲区 buffer 来决定，因为拉取过来的数据都是先放在 buffer 中，然后再进行后续的处理，buffer 的默认大小为 48MB。
+reduce 端 task 会一边拉取一边计算，不一定每次都会拉满 48MB 的数据，可能大多数时候拉取一部分数据就处理掉了。虽然说增大 reduce 端缓冲区大小可以减少拉取次数，提升 Shuffle 性能，但是有时map 端的数据量非常大，写出的速度非常快，此时 reduce 端的所有 task 在拉取的时候，有可能全部达到自己缓冲的最大极限值，即 48MB，此时，再加上 reduce 端执行的聚合函数的代码，可能会创建大量的对象，这可难会导致内存溢出，即 OOM。
+如果一旦出现 reduce 端内存溢出的问题，我们可以考虑减小 reduce 端拉取数据缓冲区的大小，例如减少为 12MB。在实际生产环境中是出现过这种问题的，这是典型的以性能换执行的原理。reduce 端拉取数据的缓冲区减小，不容易导致 OOM，但是相应的，reudce 端的拉取次数增加，造成更多的网络传输开销，造成性能的下降。注意，要保证任务能够运行，再考虑性能的优化。
 #### 10.2 JVM GC 导致的 shuffle 文件拉取失败
-		在 Spark 作业中，有时会出现 shuffle file not found 的错误，这是非常常见的一个报错，有时出现这种错误以后，选择重新执行一遍，就不再报出这种错误。		出现上述问题可能的原因是 Shuffle 操作中，后面 stage 的 task 想要去上一个 stage 的task 所在的 Executor 拉取数据，结果对方正在执行 GC，执行 GC 会导致 Executor 内所有的工作现场全部停止，比如 BlockManager、基于 netty 的网络通信等，这就会导致后面的task 拉取数据拉取了半天都没有拉取到，就会报出 shuffle file not found 的错误，而第二次再次执行就不会再出现这种错误。
-		可以通过调整 reduce 端拉取数据重试次数和 reduce 端拉取数据时间间隔这两个参数来对 Shuffle 性能进行调整，增大参数值，使得 reduce 端拉取数据的重试次数增加，并且每次失败后等待的时间间隔加长。
+在 Spark 作业中，有时会出现 shuffle file not found 的错误，这是非常常见的一个报错，有时出现这种错误以后，选择重新执行一遍，就不再报出这种错误。
+出现上述问题可能的原因是 Shuffle 操作中，后面 stage 的 task 想要去上一个 stage 的task 所在的 Executor 拉取数据，结果对方正在执行 GC，执行 GC 会导致 Executor 内所有的工作现场全部停止，比如 BlockManager、基于 netty 的网络通信等，这就会导致后面的task 拉取数据拉取了半天都没有拉取到，就会报出 shuffle file not found 的错误，而第二次再次执行就不会再出现这种错误。
+可以通过调整 reduce 端拉取数据重试次数和 reduce 端拉取数据时间间隔这两个参数来对 Shuffle 性能进行调整，增大参数值，使得 reduce 端拉取数据的重试次数增加，并且每次失败后等待的时间间隔加长。
 ```
 val conf = new SparkConf()
 .set("spark.shuffle.io.maxRetries", "60")
