@@ -11,12 +11,12 @@ object InitUtil {
 
   def main(args: Array[String]): Unit = {
     val sparkConf: SparkConf = new SparkConf().setAppName("InitData")
-    //TODO 要打包提交集群执行，注释掉
-    // .setMaster("local[*]")
+      //TODO 要打包提交集群执行，注释掉
+      .setMaster("local[*]")
     val sparkSession: SparkSession = initSparkSession(sparkConf)
-    initHiveTable(sparkSession)
-    //initBucketTable(sparkSession)
-    //saveData(sparkSession)
+    //    initHiveTable(sparkSession)
+    //    //initBucketTable(sparkSession)
+    saveData(sparkSession)
   }
 
   def initSparkSession(sparkConf: SparkConf): SparkSession = {
